@@ -229,9 +229,9 @@ PLACEHOLDER_PATTERNS = [
 DEFAULT_MIN_SECRET_LENGTH = 8
 
 MIN_SECRET_LENGTH_BY_TYPE = {
-    "password": 1,
-    "passwd": 1,
-    "pwd": 1,
+    "password": 4,
+    "passwd": 4,
+    "pwd": 4,
 }
 
 # Common programming-language/type words that frequently appear after a
@@ -244,8 +244,7 @@ NON_SECRET_WORDS = {
     "instagram", "pass:insta", "$insta::secret",
     "search-result", "response?.password", "operator", "variable", "string",
     "invalid refresh token", "$dir/private/cakey.pem", "$(python3", "selected",
-    "trim$1(tokens[i", "[keyword", "diff-add-inner","diff-delete-inner", "token",
-    "Co-Authored-By", "files"
+    "token", "files", "await"
 }
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -281,7 +280,99 @@ OPERATOR_ONLY_PATTERN = re.compile(r"^[=:+\-*/%&|^~<>!?]+$")
 
 # File types where unquoted credential-like values are more
 # likely to be code expressions or variable references than literal secrets.
-REFERENCE_HEAVY_EXTENSIONS = {".py", ".ps1"}
+REFERENCE_HEAVY_EXTENSIONS = {
+    ".py",
+    ".ps1",
+    ".js",
+    ".ts",
+    ".tsx",
+}
+
+# JavaScript/TypeScript files may contain generated or minified application
+# bundles where generic words such as token, password, and secret occur
+# thousands of times as normal program identifiers.
+HIGH_CONFIDENCE_ONLY_EXTENSIONS = {
+    ".js",
+    ".ts",
+    ".tsx",
+}
+
+# Extremely long source lines are usually minified/generated code.
+MINIFIED_LINE_LENGTH = 2000
+
+# Directory names commonly associated with installed/generated application code.
+GENERATED_CODE_PATH_PARTS = {
+    "extensions",
+    "solutionpackages",
+    "offlinefiles",
+    "vendor",
+}
+
+# Known test/fixture locations that may intentionally contain sample
+# credentials, private keys, certificates, or authentication data.
+EXCLUDED_PATH_PATTERNS = (
+    r"\\Programs\\Python\\Python\d+\\Lib\\test\\",
+)
+
+# Tracks findings that have already been reported during the current scan.
+# This prevents identical matches at the same file and line from being
+# printed and saved multiple times.
+SEEN_FINDINGS = set()
+
+
+# Confidence thresholds. Scores are heuristic evidence scores,
+# not probabilities that a credential is valid.
+CONFIDENCE_HIGH_THRESHOLD = 80
+CONFIDENCE_MEDIUM_THRESHOLD = 50
+
+# Configuration-oriented file types are stronger evidence of an
+# intentionally stored literal credential than ordinary source code.
+CONFIG_LIKE_EXTENSIONS = {
+    ".ini",
+    ".cfg",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".conf",
+    ".cnf",
+    ".properties",
+    ".toml",
+    ".tfvars",
+    ".hcl",
+}
+
+# Generic credential names that provide stronger evidence than broad
+# terms such as simply "token" or "secret".
+STRONG_GENERIC_CREDENTIAL_TYPES = {
+    "secretaccesskey",
+    "clientsecret",
+    "consumersecret",
+    "privatekey",
+    "secretkey",
+    "apikey",
+    "password",
+    "passwd",
+    "pwd",
+    "refreshtoken",
+    "accesstoken",
+    "authtoken",
+    "encryptionkey",
+    "signingkey",
+    "masterkey",
+}
+
+# Contexts where credential-shaped strings are more likely to be
+# examples or documentation. Findings are downgraded, not discarded.
+EXAMPLE_CONTEXT_PARTS = {
+    "docs",
+    "documentation",
+    "example",
+    "examples",
+    "sample",
+    "samples",
+    "fixtures",
+}
+
 
 # Used to reject quoted or unquoted names that look like symbolic credential
 # identifiers, e.g. SendGridAPIKey or PROJECT_SECRET, rather than secret data.
@@ -342,6 +433,81 @@ SECRET_PATTERN = re.compile(
         )
     """,
     re.IGNORECASE | re.VERBOSE
+)
+
+# Provider-specific credential formats.
+#
+# IMPORTANT:
+# Some providers officially guarantee only the prefix, not the complete
+# token length/character set. In those cases the suffix rules below are
+# intentionally conservative scanner heuristics.
+PROVIDER_SECRET_PATTERNS = (
+    {
+        "provider": "GitHub",
+        "credential_type": "github_token",
+        "base_score": 90,
+        "pattern": re.compile(
+            r"(?<![A-Za-z0-9_])"
+            r"(?:"
+            r"github_pat_[A-Za-z0-9_]{20,}"
+            r"|(?:ghp|gho|ghu|ghr)_[A-Za-z0-9]{20,}"
+            r"|ghs_[A-Za-z0-9_.-]{20,}"
+            r")"
+            r"(?![A-Za-z0-9_.-])"
+        ),
+    },
+
+    {
+        "provider": "Stripe",
+        "credential_type": "stripe_secret",
+        "base_score": 90,
+        "pattern": re.compile(
+            r"(?<![A-Za-z0-9_])"
+            r"(?:"
+            r"sk_(?:live|test)_[A-Za-z0-9]{16,}"
+            r"|whsec_[A-Za-z0-9]{16,}"
+            r")"
+            r"(?![A-Za-z0-9])"
+        ),
+    },
+
+    {
+        "provider": "GitLab",
+        "credential_type": "gitlab_token",
+        "base_score": 88,
+        "pattern": re.compile(
+            r"(?<![A-Za-z0-9_-])"
+            r"(?:"
+            r"glpat-|gloas-|gldt-|glrt-|glrtr-|glcbt-|"
+            r"glptt-|glft-|glimt-|glagent-|glwt-|glsoat-|glffct-"
+            r")"
+            r"[A-Za-z0-9_-]{12,}"
+            r"(?![A-Za-z0-9_-])"
+        ),
+    },
+
+    {
+        "provider": "PyPI",
+        "credential_type": "pypi_token",
+        "base_score": 95,
+        "pattern": re.compile(
+            r"(?<![A-Za-z0-9_-])"
+            r"pypi-[A-Za-z0-9_-]{85,}"
+            r"(?![A-Za-z0-9_-])"
+        ),
+    },
+
+    {
+        "provider": "Slack",
+        "credential_type": "slack_token",
+        "base_score": 88,
+        "pattern": re.compile(
+            r"(?<![A-Za-z0-9_-])"
+            r"(?:xoxb|xoxp|xapp|xwfp)-"
+            r"[A-Za-z0-9-]{10,}"
+            r"(?![A-Za-z0-9-])"
+        ),
+    },
 )
 
 # Recognizes URI-style connection strings containing embedded credentials.
@@ -419,6 +585,60 @@ def should_scan_file(path):
         return False
 
 
+def is_excluded_path(path):
+    """
+    Return True when a file belongs to a known test or fixture location
+    that intentionally contains credential-like sample data.
+    """
+
+    path_string = str(path)
+
+    return any(
+        re.search(
+            pattern,
+            path_string,
+            re.IGNORECASE
+        )
+        for pattern in EXCLUDED_PATH_PATTERNS
+    )
+
+# 
+def should_use_high_confidence_only(path, line):
+    """
+    Return True when generic credential-name matching should be disabled
+    because the file appears to contain generated or minified JS/TS code.
+    """
+
+    extension = path.suffix.lower()
+
+    if extension not in HIGH_CONFIDENCE_ONLY_EXTENSIONS:
+        return False
+
+    # Very long lines are characteristic of minified bundles.
+    if len(line) >= MINIFIED_LINE_LENGTH:
+        return True
+
+    # Common explicitly minified/bundled filenames.
+    filename = path.name.lower()
+
+    if ".min." in filename:
+        return True
+
+    if filename.endswith(".bundle.js"):
+        return True
+
+    # Installed/generated application directories.
+    path_parts = {
+        part.lower()
+        for part in path.parts
+    }
+
+    if path_parts.intersection(GENERATED_CODE_PATH_PARTS):
+        return True
+
+    return False
+
+
 # Return True if a path is the scanner itself or its generated results file.
 def is_scanner_file(path):
     program_path = (
@@ -434,18 +654,76 @@ def is_scanner_file(path):
 # Credential Scanning Functions
 # -----------------------------
 # Display a detected credential and add its formatted information to the findings list.
-def record_finding(findings, path, line_num, credential_type, credential_value):
+def record_finding(
+    findings,
+    path,
+    line_num,
+    credential_type,
+    credential_value,
+    *,
+    confidence,
+    confidence_score,
+    detection_method,
+    confidence_reasons,
+    provider=None,
+):
+    fingerprint = (
+        str(path),
+        line_num,
+        credential_type.lower(),
+        credential_value,
+    )
+
+    if fingerprint in SEEN_FINDINGS:
+        return
+
+    SEEN_FINDINGS.add(fingerprint)
+
     print(f"[Path: {path}:{line_num}]")
     print(f"Type: {credential_type}")
+
+    if provider:
+        print(f"Provider: {provider}")
+
+    print(f"Confidence: {confidence}")
+    print(f"Confidence Score: {confidence_score}/100")
+    print(f"Detection: {detection_method}")
+    print(
+        f"Confidence Basis: "
+        f"{'; '.join(confidence_reasons)}"
+    )
     print(f"Credential: {credential_value}")
     print()
 
-    findings.append(
-        f"Path: {path}\n"
-        f"Line: {line_num}\n"
-        f"Type: {credential_type}\n"
-        f"Credential: {credential_value}\n\n"
+    output_lines = [
+        f"Path: {path}",
+        f"Line: {line_num}",
+        f"Type: {credential_type}",
+    ]
+
+    if provider:
+        output_lines.append(
+            f"Provider: {provider}"
+        )
+
+    output_lines.extend(
+        [
+            f"Confidence: {confidence}",
+            f"Confidence Score: {confidence_score}/100",
+            f"Detection: {detection_method}",
+            (
+                f"Confidence Basis: "
+                f"{'; '.join(confidence_reasons)}"
+            ),
+            f"Credential: {credential_value}",
+            "",
+        ]
     )
+
+    findings.append(
+        "\n".join(output_lines) + "\n"
+    )
+
     
 
 # -----------------------------
@@ -582,21 +860,59 @@ def get_min_secret_length(credential_type):
         .replace("-", "")
     )
 
-    return MIN_SECRET_LENGTH_BY_TYPE.get(
-        normalized_type,
-        DEFAULT_MIN_SECRET_LENGTH
-    )
+    return MIN_SECRET_LENGTH_BY_TYPE.get(normalized_type, DEFAULT_MIN_SECRET_LENGTH)
+
+
+def looks_like_non_secret_structure(value, *, is_quoted=False):
+    """Return True for obvious non-secret paths, URLs, and code structures."""
+    cleaned = value.strip()
+
+    # XPath / DOM selectors are locations in a document, not credentials.
+    if re.match(
+        r"^(?:/html/|//\*?\[|//[A-Za-z])",
+        cleaned,
+        re.IGNORECASE
+    ):
+        return True
+
+    # Ordinary HTTP/HTTPS URLs are endpoints or documentation rather than
+    # credential values. Credential-bearing connection URIs are handled
+    # separately by CONNECTION_URI_PATTERN.
+    if re.match(r"^https?://", cleaned, re.IGNORECASE):
+        return True
+
+    # Be more aggressive with syntax detection only for unquoted values.
+    # A quoted password may legitimately contain punctuation such as + or &&.
+    if not is_quoted:
+
+        # Values beginning with these characters are commonly expressions,
+        # arrays, objects, calls, concatenations, or member references.
+        if cleaned.startswith(("{", "[", "(", "+", ".")):
+            return True
+
+        # Common JavaScript / TypeScript expression syntax.
+        code_markers = (
+            "?.",
+            "??",
+            "=>",
+            ".concat(",
+            "&&",
+            "||",
+            "===",
+            "!==",
+            "prototype.",
+            "=void",
+        )
+
+        if any(marker in cleaned for marker in code_markers):
+            return True
+
+    return False
+
 
 # Return True if a credential-like match should be ignored as a likely false positive.
-def is_false_positive(
-    value,
-    *,
-    credential_type=None,
-    path=None,
-    is_quoted=False,
-    key_quoted=False,
-    operator=None,
-):
+def is_false_positive(value,*,credential_type=None,path=None,is_quoted=False,key_quoted=False,operator=None,):
+    
     cleaned = normalize_candidate_value(value)
     lowered = cleaned.lower()
 
@@ -607,6 +923,9 @@ def is_false_positive(
         return True
 
     if is_variable_reference(cleaned):
+        return True
+
+    if looks_like_non_secret_structure(cleaned, is_quoted=is_quoted):
         return True
 
     # In Powershell, and unquoted $(...) value is a subexpression and not a secret
@@ -648,17 +967,9 @@ def is_false_positive(
     # In reference-heavy code files, unquoted identifiers are variables or
     # expressions, not hard-coded string literals. This now covers PowerShell
     # as well as Python.
-    if (
-        path is not None
-        and path.suffix.lower() in REFERENCE_HEAVY_EXTENSIONS
-        and not is_quoted
+    if (path is not None and path.suffix.lower() in REFERENCE_HEAVY_EXTENSIONS and not is_quoted
     ):
-        code_candidate = cleaned.lstrip("(").strip()
-        if IDENTIFIER_PATTERN.fullmatch(code_candidate):
-            return True
-
-        if looks_like_code_expression(code_candidate):
-            return True
+        return True
 
     # For every file type, obvious calls/dotted/indexed references are code when
     # they are unquoted. This catches getenv(...), config.value, token[idx], etc.
@@ -667,51 +978,424 @@ def is_false_positive(
 
     return False
 
+# -----------------------------
+# Provider / Confidence Functions
+# -----------------------------
+
+def detect_provider_secrets(line):
+    """
+    Return provider-specific credential matches found in a line.
+    """
+
+    detections = []
+
+    for rule in PROVIDER_SECRET_PATTERNS:
+        for match in rule["pattern"].finditer(line):
+            detections.append(
+                {
+                    "provider": rule["provider"],
+                    "credential_type": rule["credential_type"],
+                    "credential_value": match.group(0),
+                    "base_score": rule["base_score"],
+                }
+            )
+
+    return detections
+
+def confidence_level_from_score(score):
+    """
+    Convert a heuristic confidence score into a readable level.
+    """
+
+    if score >= CONFIDENCE_HIGH_THRESHOLD:
+        return "HIGH"
+
+    if score >= CONFIDENCE_MEDIUM_THRESHOLD:
+        return "MEDIUM"
+
+    return "LOW"
+
+def assess_confidence(
+    *,
+    credential_type,
+    credential_value,
+    path,
+    detection_method,
+    is_quoted=False,
+    provider_base_score=None,
+    high_confidence_only=False,
+):
+    """
+    Calculate a heuristic evidence score for a credential finding.
+
+    The score estimates how strongly the finding resembles actual
+    credential material. It does not determine whether the credential
+    is currently valid.
+    """
+
+    reasons = []
+
+    # -----------------------------
+    # Base score by detection method
+    # -----------------------------
+
+    if detection_method == "private_key":
+        score = 95
+        reasons.append("complete PEM private-key structure")
+
+    elif detection_method == "incomplete_private_key":
+        score = 75
+        reasons.append("private-key header found but key is incomplete")
+
+    elif detection_method == "connection_uri":
+        score = 90
+        reasons.append("URI contains embedded username/password credentials")
+
+    elif detection_method == "provider_pattern":
+        score = provider_base_score or 85
+        reasons.append("provider-specific credential signature")
+
+    else:
+        score = 40
+        reasons.append("generic credential-name assignment")
+
+    # -----------------------------
+    # Generic assignment evidence
+    # -----------------------------
+
+    if detection_method == "generic_assignment":
+
+        if is_quoted:
+            score += 10
+            reasons.append("credential value is a quoted literal")
+
+        if path is not None:
+
+            if is_interesting_file(path):
+                score += 25
+                reasons.append("credential-oriented filename")
+
+            elif path.suffix.lower() in CONFIG_LIKE_EXTENSIONS:
+                score += 10
+                reasons.append("configuration-oriented file type")
+
+            if path.suffix.lower() in REFERENCE_HEAVY_EXTENSIONS:
+                score -= 5
+                reasons.append("ordinary source-code context")
+
+        normalized_type = (
+            credential_type
+            .lower()
+            .replace("_", "")
+            .replace("-", "")
+        )
+
+        if normalized_type in STRONG_GENERIC_CREDENTIAL_TYPES:
+            score += 5
+            reasons.append("specific credential type")
+
+    # -----------------------------
+    # Context modifiers
+    # -----------------------------
+
+    if path is not None:
+        path_parts = {
+            part.lower()
+            for part in path.parts
+        }
+
+        if path_parts.intersection(EXAMPLE_CONTEXT_PARTS):
+            if detection_method in {
+                "generic_assignment",
+                "provider_pattern",
+            }:
+                score -= 20
+                reasons.append("example/documentation context")
+
+    if (
+        detection_method == "provider_pattern"
+        and high_confidence_only
+    ):
+        score -= 5
+        reasons.append("generated/minified source context")
+
+    # Never allow scores outside 0-100.
+    score = max(0, min(100, score))
+
+    level = confidence_level_from_score(score)
+
+    return level, score, reasons
+
+# Display
+def run_confidence_self_tests():
+    """
+    Run synthetic tests against provider detection and confidence scoring.
+    No real credentials are used.
+    """
+
+    provider_tests = [
+        (
+            "GitHub",
+            "ghp_" + ("A1b2" * 8),
+        ),
+        (
+            "Stripe",
+            "sk_live_" + ("A1b2" * 6),
+        ),
+        (
+            "GitLab",
+            "glpat-" + ("A1b2" * 5),
+        ),
+        (
+            "PyPI",
+            "pypi-" + ("A1b2" * 22),
+        ),
+        (
+            "Slack",
+            "xox" + "b" + ("A1b2" * 6),
+        ),
+    ]
+
+    for expected_provider, sample in provider_tests:
+        detections = detect_provider_secrets(sample)
+
+        providers = {
+            detection["provider"]
+            for detection in detections
+        }
+
+        if expected_provider not in providers:
+            raise AssertionError(
+                f"Provider test failed: {expected_provider}"
+            )
+
+    confidence_tests = [
+        {
+            "name": "provider token",
+            "expected": "HIGH",
+            "arguments": {
+                "credential_type": "github_token",
+                "credential_value": "synthetic",
+                "path": Path("project/app.js"),
+                "detection_method": "provider_pattern",
+                "provider_base_score": 90,
+            },
+        },
+        {
+            "name": "provider token in examples",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "github_token",
+                "credential_value": "synthetic",
+                "path": Path("project/examples/app.js"),
+                "detection_method": "provider_pattern",
+                "provider_base_score": 90,
+            },
+        },
+        {
+            "name": "password in .env",
+            "expected": "HIGH",
+            "arguments": {
+                "credential_type": "password",
+                "credential_value": "SyntheticPassword123!",
+                "path": Path(".env"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "password in JavaScript",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "password",
+                "credential_value": "SyntheticPassword123!",
+                "path": Path("project/login.js"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "generic token in JavaScript",
+            "expected": "LOW",
+            "arguments": {
+                "credential_type": "token",
+                "credential_value": "SomeGenericTokenValue",
+                "path": Path("project/app.js"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "plain unquoted token",
+            "expected": "LOW",
+            "arguments": {
+                "credential_type": "token",
+                "credential_value": "SomeGenericTokenValue",
+                "path": Path("notes.txt"),
+                "detection_method": "generic_assignment",
+                "is_quoted": False,
+            },
+        },
+        {
+            "name": "private key",
+            "expected": "HIGH",
+            "arguments": {
+                "credential_type": "private_key",
+                "credential_value": "synthetic-private-key",
+                "path": Path("server.pem"),
+                "detection_method": "private_key",
+            },
+        },
+        {
+            "name": "incomplete private key",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "incomplete_private_key",
+                "credential_value": "synthetic-incomplete-key",
+                "path": Path("server.pem"),
+                "detection_method": "incomplete_private_key",
+            },
+        },
+        {
+            "name": "credential connection URI",
+            "expected": "HIGH",
+            "arguments": {
+                "credential_type": "connection_uri",
+                "credential_value": "synthetic-uri",
+                "path": Path("settings.json"),
+                "detection_method": "connection_uri",
+            },
+        },
+    ]
+
+    for test in confidence_tests:
+        level, score, reasons = assess_confidence(
+            **test["arguments"]
+        )
+
+        if level != test["expected"]:
+            raise AssertionError(
+                f"{test['name']}: expected "
+                f"{test['expected']}, got {level} "
+                f"(score={score}, reasons={reasons})"
+            )
+
+    print(
+        f"Confidence self-tests passed: "
+        f"{len(provider_tests)} provider tests, "
+        f"{len(confidence_tests)} scoring tests."
+    )
 
 # -----------------------------
 # Credential Scanning
 # -----------------------------
 # Scan one line for private-key headers and hard-coded credential assignments.
-def scan_line(path, line_num, line):
+def scan_line(path, line_num, line, *, high_confidence_only=False,):
     findings = []
+    provider_values = set()
+    for provider_match in detect_provider_secrets(line):
+        credential_value = provider_match["credential_value"]
 
-    for match in SECRET_PATTERN.finditer(line):
-        credential_type = match.group("credential_type")
-        
-        double_quoted_value = match.group("double_quoted_value")
-        single_quoted_value = match.group("single_quoted_value")
-        bare_value = match.group("bare_value")
-
-        if double_quoted_value is not None:
-            credential_value = double_quoted_value
-            is_quoted = True
-        elif single_quoted_value is not None:
-            credential_value = single_quoted_value
-            is_quoted = True
-        else:
-            credential_value = bare_value
-            is_quoted = False
-
-        key_quoted = bool(match.group("key_quote"))
-        operator = match.group("operator")
-            
-        if is_false_positive(
-            credential_value,
-            credential_type=credential_type,
+        confidence, confidence_score, confidence_reasons = assess_confidence(
+            credential_type=provider_match["credential_type"],
+            credential_value=credential_value,
             path=path,
-            is_quoted=is_quoted,
-            key_quoted=key_quoted,
-            operator=operator,
-        ):
-            continue
-        record_finding(findings,path,line_num,credential_type,credential_value)
+            detection_method="provider_pattern",
+            provider_base_score=provider_match["base_score"],
+            high_confidence_only=high_confidence_only,
+        )
+
+        record_finding(
+            findings,
+            path,
+            line_num,
+            provider_match["credential_type"],
+            credential_value,
+            provider=provider_match["provider"],
+            confidence=confidence,
+            confidence_score=confidence_score,
+            detection_method="provider_pattern",
+            confidence_reasons=confidence_reasons,
+        )
+
+        provider_values.add(credential_value)
+        
+    if not high_confidence_only:
+        for match in SECRET_PATTERN.finditer(line):
+            credential_type = match.group("credential_type")
+        
+            double_quoted_value = match.group("double_quoted_value")
+            single_quoted_value = match.group("single_quoted_value")
+            bare_value = match.group("bare_value")
+
+            if double_quoted_value is not None:
+                credential_value = double_quoted_value
+                is_quoted = True
+            elif single_quoted_value is not None:
+                credential_value = single_quoted_value
+                is_quoted = True
+            else:
+                credential_value = bare_value
+                is_quoted = False
+
+            if credential_value in provider_values:
+                continue
+
+            key_quoted = bool(match.group("key_quote"))
+            operator = match.group("operator")
+            
+            if is_false_positive(
+                credential_value,
+                credential_type=credential_type,
+                path=path,
+                is_quoted=is_quoted,
+                key_quoted=key_quoted,
+                operator=operator,
+            ):
+                continue
+            confidence, confidence_score, confidence_reasons = assess_confidence(
+                credential_type=credential_type,
+                credential_value=credential_value,
+                path=path,
+                detection_method="generic_assignment",
+                is_quoted=is_quoted,
+                high_confidence_only=high_confidence_only
+                )
+            record_finding(
+                findings,
+                path,
+                line_num,
+                credential_type,
+                credential_value,
+                confidence=confidence,
+                confidence_score=confidence_score,
+                detection_method="generic_assignment",
+                confidence_reasons=confidence_reasons,
+                )
 
     for match in CONNECTION_URI_PATTERN.finditer(line):
         connection_uri = match.group("connection_uri")
         connection_password = match.group("password")
         if is_false_positive(connection_password,path=path,is_quoted=True):
             continue
-        record_finding(findings,path,line_num,"connection_uri",connection_uri)  
+        confidence, confidence_score, confidence_reasons = assess_confidence(
+            credential_type="connection_uri",
+            credential_value=connection_uri,
+            path=path,
+            detection_method="connection_uri",
+            is_quoted=True,
+            )
+        record_finding(
+            findings,
+            path,
+            line_num,
+            "connection_uri",
+            connection_uri,
+            confidence=confidence,
+            confidence_score=confidence_score,
+            detection_method="connection_uri",
+            confidence_reasons=confidence_reasons,
+            )  
         
     return findings     
 
@@ -775,7 +1459,24 @@ def scan_file(path):
                     private_key_lines.append(line.rstrip("\n"))
                     if PRIVATE_KEY_END_PATTERN.fullmatch(line.strip()):
                         private_key = "\n".join(private_key_lines)
-                        record_finding(findings, path, private_key_start_line, "private_key", private_key)
+                        
+                        confidence, confidence_score, confidence_reasons = assess_confidence(
+                            credential_type="private_key",
+                            credential_value=private_key,
+                            path=path,
+                            detection_method="private_key"
+                        )
+                            
+                        record_finding(findings,
+                                       path,
+                                       private_key_start_line,
+                                       "private_key",
+                                       private_key,
+                                       confidence=confidence,
+                                       confidence_score=confidence_score,
+                                       detection_method="private_key",
+                                       confidence_reasons=confidence_reasons,
+                                       )
                         private_key_lines = []
                         private_key_start_line = None
                     continue
@@ -783,10 +1484,30 @@ def scan_file(path):
                     private_key_start_line = line_num
                     private_key_lines = [line.rstrip("\n")]
                     continue
-                findings.extend(scan_line(path, line_num, line))
+                high_confidence_only = should_use_high_confidence_only(path, line)
+                findings.extend(
+                    scan_line(path, line_num, line, high_confidence_only=high_confidence_only,)
+                    )
             if private_key_lines:
                 incomplete_private_key = "\n".join(private_key_lines)
-                record_finding(findings, path, private_key_start_line, "incomplete_private_key", incomplete_private_key)
+                confidence, confidence_score, confidence_reasons = assess_confidence(
+                    credential_type="incomplete_private_key",
+                    credential_value=incomplete_private_key,
+                    path=path,
+                    detection_method="incomplete_private_key",
+                    )
+                    
+                record_finding(
+                    findings,
+                    path,
+                    private_key_start_line,
+                    "incomplete_private_key",
+                    incomplete_private_key,
+                    confidence=confidence,
+                    confidence_score=confidence_score,
+                    detection_method="incomplete_private_key",
+                    confidence_reasons=confidence_reasons,
+                    )
             
     except PermissionError:
         pass
@@ -811,6 +1532,9 @@ def scan_directory(root):
             path = Path(current_root) / filename
 
             if is_scanner_file(path):
+                continue
+
+            if is_excluded_path(path):
                 continue
 
             if is_interesting_file(path):
@@ -857,9 +1581,15 @@ def main():
     # print(f"Running as administrator: {bool(is_admin())}")  
 
     root = Path.home() # Set the root to the home directory
+
+    SEEN_FINDINGS.clear()
+    
     print(f"\nScanning: {root}\n")
+    
     findings = scan_directory(root)
+    
     save_results(findings)
+    
     input()
 
 if __name__ == "__main__":
