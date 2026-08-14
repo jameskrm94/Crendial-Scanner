@@ -15,6 +15,8 @@ import ctypes
 import sys
 import os
 import codecs
+import base64
+from urllib.parse import urlsplit
 
 # -----------------------------
 # Configuration
@@ -24,6 +26,7 @@ import codecs
 INTERESTING_NAMES = {
     ".env",
     "credentials.json",
+    "auth.json",
     "config.ini",
     "settings.json",
     ".npmrc",
@@ -328,14 +331,39 @@ STRONG_GENERIC_CREDENTIAL_TYPES = {
 # Contexts where credential-shaped strings are more likely to be
 # examples or documentation. Findings are downgraded, not discarded.
 EXAMPLE_CONTEXT_PARTS = {
+    "doc",
     "docs",
     "documentation",
     "example",
     "examples",
     "sample",
     "samples",
+    "template",
+    "templates",
+    "fixture",
     "fixtures",
+    "test",
+    "tests",
+    "testing",
+    "mock",
+    "mocks",
+    "demo",
 }
+
+# Directory names commonly associated with localization and translation
+# resources, where words such as "password" are often UI text rather than
+# hard-coded credential values.
+LOCALIZATION_CONTEXT_PARTS = {
+    "lang",
+    "locale",
+    "locales",
+    "localization",
+    "translations",
+    "translation",
+    "i18n",
+    "l10n",
+}
+
 
 
 # Used to reject quoted or unquoted names that look like symbolic credential
@@ -566,6 +594,42 @@ def is_excluded_path(path):
         for pattern in EXCLUDED_PATH_PATTERNS
     )
 
+def has_example_context(path):
+    """
+    Return True when a path appears to belong to an example, sample,
+    template, test, fixture, mock, demo, or documentation context.
+    """
+
+    for part in path.parts:
+        words = {
+            word.lower()
+            for word in re.split(r"[^A-Za-z0-9]+", part)
+            if word
+        }
+
+        if words.intersection(EXAMPLE_CONTEXT_PARTS):
+            return True
+
+    return False
+
+def has_localization_context(path):
+    """
+    Return True when a path appears to belong to localization,
+    translation, language, or internationalization resources.
+    """
+
+    for part in path.parts:
+        words = {
+            word.lower()
+            for word in re.split(r"[^A-Za-z0-9]+", part)
+            if word
+        }
+
+        if words.intersection(LOCALIZATION_CONTEXT_PARTS):
+            return True
+
+    return False
+
 # 
 def should_use_high_confidence_only(path, line):
     """
@@ -679,7 +743,7 @@ def record_finding(
                 f"Confidence Basis: "
                 f"{'; '.join(confidence_reasons)}"
             ),
-            f"Credential: {credential_value}",
+            f"Credential: [REDACTED]",
             "",
         ]
     )
@@ -826,7 +890,246 @@ def get_min_secret_length(credential_type):
 
     return MIN_SECRET_LENGTH_BY_TYPE.get(normalized_type, DEFAULT_MIN_SECRET_LENGTH)
 
+def looks_machine_generated(credential_type, value):
+    """
+    Return True when a token/key-like credential has a value shape
+    commonly associated with machine-generated secret material.
+    """
 
+    normalized_type = (
+        credential_type
+        .lower()
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    machine_generated_types = {
+        "apikey",
+        "secretaccesskey",
+        "accesskeyid",
+        "clientsecret",
+        "consumersecret",
+        "refreshtoken",
+        "accesstoken",
+        "authtoken",
+        "secretkey",
+        "encryptionkey",
+        "signingkey",
+        "masterkey",
+        "token",
+    }
+
+    if normalized_type not in machine_generated_types:
+        return False
+
+    cleaned = normalize_candidate_value(value)
+
+    if len(cleaned) < 20:
+        return False
+
+    if any(character.isspace() for character in cleaned):
+        return False
+
+    has_letter = any(character.isalpha() for character in cleaned)
+    has_digit = any(character.isdigit() for character in cleaned)
+    has_symbol = any(
+        not character.isalnum()
+        for character in cleaned
+    )
+
+    # Long hexadecimal values are common for generated keys/tokens.
+    if re.fullmatch(r"[A-Fa-f0-9]{32,}", cleaned):
+        return True
+
+    # Long mixed alphanumeric strings are also common token shapes.
+    if (
+        len(cleaned) >= 24
+        and has_letter
+        and has_digit
+        and not has_symbol
+    ):
+        return True
+
+    # Base64/URL-safe/token-style strings often combine all three groups.
+    if (
+        len(cleaned) >= 24
+        and has_letter
+        and has_digit
+        and has_symbol
+    ):
+        return True
+
+    return False
+
+##
+def looks_like_synthetic_provider_value(value):
+    """
+    Return True when a provider-shaped credential looks deliberately
+    synthetic, repetitive, or example-generated.
+    """
+
+    cleaned = normalize_candidate_value(value)
+    lowered = cleaned.lower()
+
+    synthetic_words = (
+        "example",
+        "sample",
+        "dummy",
+        "placeholder",
+        "synthetic",
+    )
+
+    if any(word in lowered for word in synthetic_words):
+        return True
+
+    provider_prefixes = (
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghr_",
+        "ghs_",
+        "sk_live_",
+        "sk_test_",
+        "whsec_",
+        "glpat-",
+        "pypi-",
+        "xoxb-",
+        "xoxp-",
+        "xapp-",
+        "xwfp-",
+    )
+
+    body = cleaned
+
+    for prefix in provider_prefixes:
+        if lowered.startswith(prefix):
+            body = cleaned[len(prefix):]
+            break
+
+    # Detect bodies made by repeating a tiny artificial pattern,
+    # such as A1b2A1b2A1b2A1b2...
+    for chunk_size in range(1, 5):
+        if len(body) < chunk_size * 4:
+            continue
+
+        chunk = body[:chunk_size]
+
+        if chunk * (len(body) // chunk_size) == body:
+            return True
+
+    return False
+
+def has_valid_private_key_structure(value):
+    """
+    Return True when a PEM private-key block has matching boundaries,
+    valid Base64 content, and a plausible decoded key structure.
+    """
+
+    lines = [
+        line.strip()
+        for line in value.strip().splitlines()
+        if line.strip()
+    ]
+
+    if len(lines) < 3:
+        return False
+
+    begin_match = re.fullmatch(
+        r"-----BEGIN "
+        r"(?P<label>(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY)"
+        r"-----",
+        lines[0],
+        re.IGNORECASE,
+    )
+
+    end_match = re.fullmatch(
+        r"-----END "
+        r"(?P<label>(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY)"
+        r"-----",
+        lines[-1],
+        re.IGNORECASE,
+    )
+
+    if not begin_match or not end_match:
+        return False
+
+    if (
+        begin_match.group("label").lower()
+        != end_match.group("label").lower()
+    ):
+        return False
+
+    encoded_body = "".join(lines[1:-1])
+
+    if not encoded_body:
+        return False
+
+    try:
+        decoded_body = base64.b64decode(
+            encoded_body,
+            validate=True,
+        )
+    except Exception:
+        return False
+
+    if not decoded_body:
+        return False
+
+    label = begin_match.group("label").upper()
+
+    # OpenSSH private keys use their own binary container format.
+    if label == "OPENSSH PRIVATE KEY":
+        return decoded_body.startswith(
+            b"openssh-key-v1\x00"
+        )
+
+    # RSA, EC, DSA, PKCS#8, and encrypted PKCS#8 private keys
+    # normally use ASN.1 DER sequences, which begin with 0x30.
+    return decoded_body.startswith(b"\x30")
+##
+def has_low_risk_connection_uri_context(value):
+    """
+    Return True when a credential-bearing connection URI points to a
+    localhost, loopback, or reserved example/test host.
+    """
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+
+    if not hostname:
+        return False
+
+    hostname = hostname.lower().rstrip(".")
+
+    exact_low_risk_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "example.com",
+        "example.org",
+        "example.net",
+    }
+
+    if hostname in exact_low_risk_hosts:
+        return True
+
+    low_risk_suffixes = (
+        ".localhost",
+        ".test",
+        ".example",
+        ".invalid",
+    )
+
+    if hostname.endswith(low_risk_suffixes):
+        return True
+
+    return False
+##
 def looks_like_non_secret_structure(value, *, is_quoted=False):
     """Return True for obvious non-secret paths, URLs, and code structures."""
     cleaned = value.strip()
@@ -873,6 +1176,60 @@ def looks_like_non_secret_structure(value, *, is_quoted=False):
 
     return False
 
+####
+def appears_in_comment(line, match_start, path):
+    """
+    Return True when a credential match appears inside a single-line comment.
+    """
+
+    if path is None:
+        return False
+
+    prefix = line[:match_start].lstrip()
+    extension = path.suffix.lower()
+
+    hash_comment_extensions = {
+        ".py",
+        ".ps1",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".cnf",
+        ".properties",
+        ".tf",
+        ".tfvars",
+        ".hcl",
+    }
+
+    slash_comment_extensions = {
+        ".js",
+        ".ts",
+        ".tsx",
+        ".java",
+        ".cs",
+        ".c",
+        ".go",
+        ".rs",
+        ".kt",
+        ".kts",
+        ".swift",
+        ".scala",
+    }
+
+    if extension in hash_comment_extensions:
+        return prefix.startswith("#")
+
+    if extension in slash_comment_extensions:
+        return prefix.startswith("//")
+
+    return False
 
 # Return True if a credential-like match should be ignored as a likely false positive.
 def is_false_positive(value,*,credential_type=None,path=None,is_quoted=False,key_quoted=False,operator=None,):
@@ -961,6 +1318,7 @@ def detect_provider_secrets(line):
                     "credential_type": rule["credential_type"],
                     "credential_value": match.group(0),
                     "base_score": rule["base_score"],
+                    "match_start": match.start(),
                 }
             )
 
@@ -988,10 +1346,12 @@ def assess_confidence(
     is_quoted=False,
     provider_base_score=None,
     high_confidence_only=False,
+    in_comment=False,
+    line_text=None,
+    match_start=None,
 ):
     """
     Calculate a heuristic evidence score for a credential finding.
-
     The score estimates how strongly the finding resembles actual
     credential material. It does not determine whether the credential
     is currently valid.
@@ -1004,8 +1364,12 @@ def assess_confidence(
     # -----------------------------
 
     if detection_method == "private_key":
-        score = 95
-        reasons.append("complete PEM private-key structure")
+        if has_valid_private_key_structure(credential_value):
+            score = 95
+            reasons.append("complete PEM private-key structure")
+        else:
+            score = 60
+            reasons.append("private-key boundaries found but encoded key structure is invalid")
 
     elif detection_method == "incomplete_private_key":
         score = 75
@@ -1020,8 +1384,21 @@ def assess_confidence(
         reasons.append("provider-specific credential signature")
 
     else:
-        score = 40
+        score=40
         reasons.append("generic credential-name assignment")
+
+    if(
+        detection_method == "provider_pattern"
+        and looks_like_synthetic_provider_value(credential_value)
+    ):
+        score -=25
+        reasons.append("provider-shaped credential appears synthetic or repetitive")
+    if(detection_method == "connection_uri"
+       and has_low_risk_connection_uri_context(credential_value)
+    ):
+        score -=30
+        reasons.append("connection URI uses localhost or reserved example/test host")
+        
 
     # -----------------------------
     # Generic assignment evidence
@@ -1036,16 +1413,23 @@ def assess_confidence(
         if path is not None:
 
             if is_interesting_file(path):
-                score += 25
-                reasons.append("credential-oriented filename")
+                if has_example_context(path):
+                    score -=10
+                    reasons.append("credential-oriented file is marked as example/template")
+                else:
+                    score+=25
+                    reasons.append("credential-oriented filename")
 
             elif path.suffix.lower() in CONFIG_LIKE_EXTENSIONS:
                 score += 10
                 reasons.append("configuration-oriented file type")
 
-            if path.suffix.lower() in REFERENCE_HEAVY_EXTENSIONS:
+            if (path.suffix.lower() in REFERENCE_HEAVY_EXTENSIONS
+                and credential_type.lower().replace("_", "").replace("-", "")
+                in {"token", "secret"}
+            ):
                 score -= 5
-                reasons.append("ordinary source-code context")
+                reasons.append("broad credential name in ordinary source-code context")
 
         normalized_type = (
             credential_type
@@ -1058,29 +1442,49 @@ def assess_confidence(
             score += 5
             reasons.append("specific credential type")
 
+        if looks_machine_generated(credential_type, credential_value,):
+            score+=10
+            reasons.append("credential value has a machine-generated token/key shape")
+
     # -----------------------------
     # Context modifiers
     # -----------------------------
 
-    if path is not None:
-        path_parts = {
-            part.lower()
-            for part in path.parts
-        }
+    if path is not None and has_example_context(path):
+        if detection_method == "generic_assignment":
+            if not is_interesting_file(path):
+                score-=20
+                reasons.append("example/test/template context")
 
-        if path_parts.intersection(EXAMPLE_CONTEXT_PARTS):
-            if detection_method in {
-                "generic_assignment",
-                "provider_pattern",
-            }:
-                score -= 20
-                reasons.append("example/documentation context")
+        elif detection_method == "provider_pattern":
+            score-=20
+            reasons.append("example/test/template context")
+        elif detection_method == "connection_uri":
+            score-=20
+            reasons.append("example/test/template context")
+            
+    if(
+        path is not None
+        and detection_method == "generic_assignment"
+        and has_localization_context(path)
+    ):
+        score-=25
+        reasons.append("localization/translation resource context")
+
+    if in_comment:
+        score-=25
+        reasons.append("credential assignment appears inside a comment")
 
     if (
         detection_method == "provider_pattern"
         and high_confidence_only
     ):
         score -= 5
+        reasons.append("generated/minified source context")
+    if(detection_method == "connection_uri"
+       and high_confidence_only
+    ):
+        score-=15
         reasons.append("generated/minified source context")
 
     # Never allow scores outside 0-100.
@@ -1139,7 +1543,7 @@ def run_confidence_self_tests():
             "expected": "HIGH",
             "arguments": {
                 "credential_type": "github_token",
-                "credential_value": "synthetic",
+                "credential_value": "ghp_A7k9Lm2Np4Qr6St8Uv1Wx3Yz5Ab7Cd9E",
                 "path": Path("project/app.js"),
                 "detection_method": "provider_pattern",
                 "provider_base_score": 90,
@@ -1150,8 +1554,19 @@ def run_confidence_self_tests():
             "expected": "MEDIUM",
             "arguments": {
                 "credential_type": "github_token",
-                "credential_value": "synthetic",
+                "credential_value": "ghp_A7k9Lm2Np4Qr6St8Uv1Wx3Yz5Ab7Cd9E",
                 "path": Path("project/examples/app.js"),
+                "detection_method": "provider_pattern",
+                "provider_base_score": 90,
+            },
+        },
+        {
+            "name": "provider token in .env.example",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "github_token",
+                "credential_value": "ghp_A7k9Lm2Np4Qr6St8Uv1Wx3Yz5Ab7Cd9E",
+                "path": Path(".env.example"),
                 "detection_method": "provider_pattern",
                 "provider_base_score": 90,
             },
@@ -1190,6 +1605,41 @@ def run_confidence_self_tests():
             },
         },
         {
+            "name": "specific API key in JavaScript",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "api_key",
+                "credential_value": "a8F2kP9mQ4xT7vN3zR6wY1cD9sL4",
+                "path": Path("project/app.js"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "password in ordinary JSON",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "password",
+                "credential_value": "SyntheticPassword123!",
+                "path": Path("project/config/messages.json"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "password in localization JSON",
+            "expected": "LOW",
+            "arguments": {
+                "credential_type": "password",
+                "credential_value": "SyntheticPassword123!",
+                "path": Path("assets/lang/de.json"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+                
+                
+        {
             "name": "plain unquoted token",
             "expected": "LOW",
             "arguments": {
@@ -1205,11 +1655,30 @@ def run_confidence_self_tests():
             "expected": "HIGH",
             "arguments": {
                 "credential_type": "private_key",
-                "credential_value": "synthetic-private-key",
+                "credential_value": (
+                    "-----BEGIN PRIVATE KEY-----\n"
+                    "MAMCAQA=\n"
+                    "-----END PRIVATE KEY-----"
+                ),
                 "path": Path("server.pem"),
                 "detection_method": "private_key",
             },
         },
+        {
+            "name": "invalid complete private key",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "private_key",
+                "credential_value": (
+                    "-----BEGIN PRIVATE KEY-----\n"
+                    "not-valid-base64!!!\n"
+                    "-----END PRIVATE KEY-----"
+                ),
+                "path": Path("server.pem"),
+                "detection_method": "private_key",
+            },
+        },
+    
         {
             "name": "incomplete private key",
             "expected": "MEDIUM",
@@ -1221,16 +1690,113 @@ def run_confidence_self_tests():
             },
         },
         {
-            "name": "credential connection URI",
+            "name": "production credential connection URI",
             "expected": "HIGH",
             "arguments": {
                 "credential_type": "connection_uri",
-                "credential_value": "synthetic-uri",
+                "credential_value": (
+                   "postgresql://admin:Secret123!"
+                   "@prod-db.company.com/app"
+                ),
                 "path": Path("settings.json"),
                 "detection_method": "connection_uri",
             },
         },
-    ]
+        {
+            "name": "generated production credential connection URI",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "connection_uri",
+                "credential_value": (
+                    "postgresql://admin:Secret123!"
+                    "@prod-db.company.com/app"
+                ),
+                "path": Path("Extensions/app.js"),
+                "detection_method": "connection_uri",
+                "high_confidence_only": True,
+            },
+        },
+        {
+           "name": "generated localhost credential connection URI",
+           "expected": "LOW",
+           "arguments": {
+               "credential_type": "connection_uri",
+               "credential_value": (
+                   "postgresql://admin:Secret123!"
+                   "@localhost/app"
+                ),
+               "path": Path("Extensions/app.js"),
+               "detection_method": "connection_uri",
+               "high_confidence_only": True,
+            },
+        },
+    
+        {
+            "name": "localhost credential connection URI",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "connection_uri",
+                "credential_value": (
+                    "postgresql://admin:Secret123!"
+                    "@localhost/app"
+                ),
+                "path": Path("settings.json"),
+                "detection_method": "connection_uri",
+            },
+            
+    },
+        {
+            "name": "access token in auth.json",
+            "expected": "HIGH",
+            "arguments": {
+                "credential_type": "access_token",
+                "credential_value": "a8F2kP9mQ4xT7vN3zR6wY1cD9sL4",
+                "path": Path("auth.json"),
+                "detection_method": "generic_assignment",
+                "is_quoted": True,
+            },
+        },
+        {
+            "name": "production connection URI in tests",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "connection_uri",
+                "credential_value": (
+                    "postgresql://admin:Secret123!"
+                    "@prod-db.company.com/app"
+                ),
+                "path": Path("tests/settings.json"),
+                "detection_method": "connection_uri",
+            },
+        },
+            {
+                "name": "localhost connection URI in tests",
+                "expected": "LOW",
+                "arguments": {
+                    "credential_type": "connection_uri",
+                    "credential_value": (
+                        "postgresql://admin:Secret123!"
+                        "@localhost/app"
+                    ),
+                    "path": Path("tests/settings.json"),
+                    "detection_method": "connection_uri",
+                },
+            },
+        {
+            "name": "provider token inside comment",
+            "expected": "MEDIUM",
+            "arguments": {
+                "credential_type": "github_token",
+                "credential_value": "ghp_A7k9Lm2Np4Qr6St8Uv1Wx3Yz5Ab7Cd9E",
+                "path": Path("project/app.js"),
+                "detection_method": "provider_pattern",
+                "provider_base_score": 90,
+                "in_comment": True,
+            },
+        },
+                        
+                          
+]
 
     for test in confidence_tests:
         level, score, reasons = assess_confidence(
@@ -1259,6 +1825,11 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
     provider_values = set()
     for provider_match in detect_provider_secrets(line):
         credential_value = provider_match["credential_value"]
+        in_comment = appears_in_comment(
+            line,
+            provider_match["match_start"],
+            path,
+        )
 
         confidence, confidence_score, confidence_reasons = assess_confidence(
             credential_type=provider_match["credential_type"],
@@ -1267,6 +1838,9 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
             detection_method="provider_pattern",
             provider_base_score=provider_match["base_score"],
             high_confidence_only=high_confidence_only,
+            in_comment=in_comment,
+            line_text=line,
+            match_start=provider_match["match_start"], #Hello ChatGPT :D
         )
 
         record_finding(
@@ -1307,6 +1881,8 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
 
             key_quoted = bool(match.group("key_quote"))
             operator = match.group("operator")
+
+            in_comment = appears_in_comment(line, match.start(),path)
             
             if is_false_positive(
                 credential_value,
@@ -1323,7 +1899,10 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
                 path=path,
                 detection_method="generic_assignment",
                 is_quoted=is_quoted,
-                high_confidence_only=high_confidence_only
+                high_confidence_only=high_confidence_only,
+                in_comment=in_comment,
+                line_text=line,
+                match_start=match.start(),
                 )
             record_finding(
                 findings,
@@ -1340,6 +1919,11 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
     for match in CONNECTION_URI_PATTERN.finditer(line):
         connection_uri = match.group("connection_uri")
         connection_password = match.group("password")
+        in_comment = appears_in_comment(
+            line,
+            match.start(),
+            path,
+        )
         if is_false_positive(connection_password,path=path,is_quoted=True):
             continue
         confidence, confidence_score, confidence_reasons = assess_confidence(
@@ -1348,6 +1932,10 @@ def scan_line(path, line_num, line, *, high_confidence_only=False,):
             path=path,
             detection_method="connection_uri",
             is_quoted=True,
+            high_confidence_only=high_confidence_only,
+            in_comment=in_comment,
+            line_text=line,
+            match_start=match.start(),
             )
         record_finding(
             findings,
@@ -1542,7 +2130,8 @@ def save_results(findings):
 # Set the scan root, run the credential scan, and save the resulting findings.
 def main():
     # request_admin() # Most likely NOT required
-    # print(f"Running as administrator: {bool(is_admin())}")  
+    # print(f"Running as administrator: {bool(is_admin())}")
+    input("Are you ready? Press Enter to begin...")
 
     root = Path.home() # Set the root to the home directory
 
